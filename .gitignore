@@ -1,0 +1,20 @@
+# Teacher-provided photos and local generated outputs stay on this computer.
+/*.jpg
+/*.jpeg
+/*.png
+/*.pdf
+/交付/
+/示例处理结果/
+.env
+.env.*
+!.env.example
+*.zip
+*.exe
+__pycache__/
+.pytest_cache/
+.venv/
+build/
+dist/
+qa/
+*.py[cod]
+*.log
