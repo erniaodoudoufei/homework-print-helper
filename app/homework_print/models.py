@@ -8,6 +8,13 @@ import numpy as np
 
 
 @dataclass(frozen=True)
+class WhiteoutRegion:
+    # Four corners in the EXIF-corrected source plane. Values can extend past
+    # [0, 1] when a selection includes the white padding around a rotated photo.
+    source_quad: tuple[tuple[float, float], ...]
+
+
+@dataclass(frozen=True)
 class EditSettings:
     # Quad uses EXIF-corrected source coordinates, normalized to [0, 1].
     quad: tuple[tuple[float, float], ...] | None = None
@@ -18,6 +25,7 @@ class EditSettings:
     whitening: int = 75
     ink: int = 15
     grayscale: bool = False
+    whiteouts: tuple[WhiteoutRegion, ...] = ()
 
 
 @dataclass

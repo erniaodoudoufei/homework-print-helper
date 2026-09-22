@@ -8,6 +8,7 @@ import sys
 import json
 import zipfile
 from importlib.metadata import distribution
+from homework_print import __version__
 
 ROOT = Path(__file__).resolve().parent
 WORKSPACE = ROOT.parent.resolve()
@@ -81,7 +82,7 @@ subprocess.run([str(RELEASE / f"{NAME}.exe"), "--smoke-test", str(qa)], cwd=RELE
 report = json.loads((qa / "smoke-result.json").read_text(encoding="utf-8"))
 assert report["status"] == "passed"
 
-archive = DELIVERY / f"{NAME}-1.0-Windows便携版.zip"
+archive = DELIVERY / f"{NAME}-{__version__}-Windows便携版.zip"
 with zipfile.ZipFile(archive, "w", zipfile.ZIP_DEFLATED, compresslevel=6) as z:
     for path in RELEASE.rglob("*"):
         if path.is_file():

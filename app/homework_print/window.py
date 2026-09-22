@@ -15,18 +15,20 @@ from PySide6.QtWidgets import (QApplication, QComboBox, QDialog, QDoubleSpinBox,
                               QSlider, QSplitter, QStackedWidget, QVBoxLayout, QWidget)
 
 from .jobs import Job
+from . import __version__
 from .models import EditSettings, Page
 from .outputs import export_pngs, prepare_pages, to_qimage
 from .print_dialog import PrintDialog
 from .processing import checkpoint, geometry, load_rgb, process, resize_preview, suggest_settings
 from .style import STYLE
 from .widgets import GeometryDialog, ImageView, PageList
+from .whiteout import WhiteoutDialog
 
 
 class MainWindow(QMainWindow):
     def __init__(self, settings: QSettings | None = None):
         super().__init__()
-        self.setWindowTitle("作业图片打印助手")
+        self.setWindowTitle(f"作业图片打印助手 {__version__}")
         self.resize(1380, 880)
         self.setMinimumSize(1100, 700)
         self.setAcceptDrops(True)
@@ -179,6 +181,7 @@ class MainWindow(QMainWindow):
         adjust.addLayout(rotate)
         self.button("四角拉正", lambda: self.edit_geometry("quad"), adjust)
         self.button("裁切范围", lambda: self.edit_geometry("crop"), adjust)
+        self.whiteout_button = self.button("遮挡答案", self.edit_whiteouts, adjust)
         angle_row = QHBoxLayout()
         angle_row.addWidget(QLabel("倾斜微调"))
         self.angle = QDoubleSpinBox()
@@ -544,9 +547,31 @@ class MainWindow(QMainWindow):
             return settings, note
         def completed(result):
             settings, note = result
-            self.change_page(settings, note)
+            self.change_page(replace(settings, whiteouts=page.settings.whiteouts), note)
             self.pending_preview = True
         self.start_job("auto", work, completed)
+
+    def edit_whiteouts(self):
+        if self.job or not self.current_page():
+            return
+        self.commit_controls()
+        self.preview_timer.stop()
+        page = self.current_page()
+        settings, source = page.settings, page.original_preview
+        def work(progress, cancel):
+            progress(25, "正在准备遮挡答案画面…")
+            return process(source, replace(settings, whiteouts=()), cancel=cancel)
+        def completed(image):
+            if self._closing:
+                return
+            dialog = WhiteoutDialog(image, (source.shape[1], source.shape[0]), settings, self)
+            if dialog.exec() == QDialog.DialogCode.Accepted:
+                regions = dialog.selection()
+                self.change_page(replace(settings, whiteouts=regions),
+                                 f"已遮挡 {len(regions)} 处答案；可继续调整或打印" if regions else "已清空遮挡")
+            dialog.deleteLater()
+            self.preview_timer.start()
+        self.start_job("whiteout", work, completed)
 
     def undo(self):
         if self.is_blocked():
@@ -631,6 +656,8 @@ class MainWindow(QMainWindow):
         self.undo_button.setEnabled(page is not None and bool(page.undo_stack) and not blocked)
         self.redo_button.setEnabled(page is not None and bool(page.redo_stack) and not blocked)
         self.auto_button.setEnabled(page is not None and self.job is None)
+        self.whiteout_button.setEnabled(page is not None and self.job is None)
+        self.whiteout_button.setText(f"遮挡答案（{len(page.settings.whiteouts)}）" if page and page.settings.whiteouts else "遮挡答案")
 
     def fit_views(self):
         self.original_view.fit_image()

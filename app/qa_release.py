@@ -5,11 +5,12 @@ import json
 import os
 import subprocess
 import zipfile
+from homework_print import __version__
 
 ROOT = Path(__file__).resolve().parent
 WORKSPACE = ROOT.parent
-archive = WORKSPACE / "交付" / "作业图片打印助手-1.0-Windows便携版.zip"
-destination = ROOT / "qa" / "解压独立运行 portable"
+archive = WORKSPACE / "交付" / f"作业图片打印助手-{__version__}-Windows便携版.zip"
+destination = ROOT / "qa" / f"解压独立运行 portable {__version__}"
 destination.mkdir(parents=True, exist_ok=True)
 with zipfile.ZipFile(archive) as package:
     for info in package.infolist():

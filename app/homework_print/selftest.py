@@ -4,15 +4,19 @@ from __future__ import annotations
 from pathlib import Path
 import json
 import time
+from hashlib import sha256
 
 import cv2
 import numpy as np
 from PIL import Image
-from PySide6.QtCore import QSize, QSettings
+from PySide6.QtCore import QPointF, QSize, QSettings, QTimer, Qt
+from PySide6.QtTest import QTest
 from PySide6.QtPdf import QPdfDocument
 from PySide6.QtWidgets import QApplication
 
 from .models import PrintOptions
+from . import __version__
+from .whiteout import WhiteoutDialog
 from .print_dialog import PrintDialog
 from .printing import export_pdf
 from .processing import process, load_rgb
@@ -38,8 +42,11 @@ def run_selftest(window, destination: Path):
         paper[y, :] = [230 - y * 30 // height, 223 - y * 30 // height, 199 - y * 30 // height]
     for y in range(150, 1080, 100):
         cv2.line(paper, (60, y), (790, y), (50, 85, 75), 1)
-    cv2.putText(paper, "HOMEWORK  12345", (70, 105), cv2.FONT_HERSHEY_SIMPLEX, 1.25, (25, 30, 32), 3)
-    cv2.putText(paper, "Keep red notes", (80, 240), cv2.FONT_HERSHEY_SIMPLEX, 1.0, (155, 20, 15), 2)
+    cv2.putText(paper, "MATH PRACTICE", (70, 105), cv2.FONT_HERSHEY_SIMPLEX, 1.25, (25, 30, 32), 3)
+    for question, answer, y in (("1.  8 + 7 =", "15", 225), ("2.  6 x 4 =", "24", 425),
+                                ("3. 35 - 8 =", "27", 625), ("4. 42 / 6 =", "7", 825)):
+        cv2.putText(paper, question, (80, y), cv2.FONT_HERSHEY_SIMPLEX, 1.25, (25, 30, 32), 2)
+        cv2.putText(paper, answer, (460, y), cv2.FONT_HERSHEY_SIMPLEX, 1.25, (180, 20, 15), 3)
     source = destination / "测试图片.png"
     Image.fromarray(paper).save(source)
     landscape = np.full((600, 1000, 3), 238, np.uint8)
@@ -48,6 +55,7 @@ def run_selftest(window, destination: Path):
         cv2.line(landscape, (50, y), (950, y), (80, 80, 80), 1)
     source2 = destination / "横向测试.png"
     Image.fromarray(landscape).save(source2)
+    hashes = [sha256(path.read_bytes()).hexdigest() for path in (source, source2)]
     window.import_files([source, source2])
     wait_idle(window)
     assert len(window.pages) == 2
@@ -63,12 +71,59 @@ def run_selftest(window, destination: Path):
     window.redo()
     wait_idle(window)
     assert window.current_page().settings.whitening == 60
+    # Exercise the actual background preparation and modal dialog through mouse
+    # events, so packaged self-checks cover the complete new user flow.
+    interaction_errors = []
+    interacted = []
+    timer = QTimer(window)
+    def edit_answers():
+        dialog = QApplication.activeModalWidget()
+        if not isinstance(dialog, WhiteoutDialog):
+            return
+        timer.stop()
+        try:
+            view = dialog.view
+            for y in (175, 375):
+                a = view.mapFromScene(QPointF(440, y))
+                b = view.mapFromScene(QPointF(575, y + 70))
+                QTest.mousePress(view.viewport(), Qt.MouseButton.LeftButton, pos=a)
+                QTest.mouseMove(view.viewport(), b, 20)
+                QTest.mouseRelease(view.viewport(), Qt.MouseButton.LeftButton, pos=b)
+            assert len(dialog.selection()) == 2
+            view.undo()
+            assert len(dialog.selection()) == 1
+            view.redo()
+            assert len(dialog.selection()) == 2
+            QApplication.processEvents()
+            dialog.grab().save(str(destination / "遮挡答案.png"))
+            interacted.append(True)
+            dialog.accept()
+        except Exception as exc:
+            interaction_errors.append(exc)
+            dialog.reject()
+    timer.timeout.connect(edit_answers)
+    timer.start(20)
+    window.edit_whiteouts()
+    wait_idle(window)
+    timer.stop()
+    timer.deleteLater()
+    assert interacted and not interaction_errors, interaction_errors
+    assert len(window.current_page().settings.whiteouts) == 2
+    window.undo()
+    wait_idle(window)
+    assert not window.current_page().settings.whiteouts
+    window.redo()
+    wait_idle(window)
+    assert len(window.current_page().settings.whiteouts) == 2
     window.compare.setCurrentIndex(2)
     QApplication.processEvents()
     window.grab().save(str(destination / "应用界面.png"))
     prepared = []
     for i, page in enumerate(window.ordered_pages()):
         result = process(load_rgb(page.source), page.settings)
+        if i == 0:
+            assert np.all(result[185:235, 450:565] == 255)
+            assert np.all(result[385:435, 450:565] == 255)
         target = destination / f"处理结果-{i + 1}.png"
         Image.fromarray(result).save(target)
         prepared.append((target, result.shape[1], result.shape[0], page.title))
@@ -101,7 +156,9 @@ def run_selftest(window, destination: Path):
     dialog.refresh_timer.stop()
     dialog.close()
     dialog.deleteLater()
-    (destination / "smoke-result.json").write_text(json.dumps({"status": "passed", "pages": len(prepared),
+    assert hashes == [sha256(path.read_bytes()).hexdigest() for path in (source, source2)]
+    (destination / "smoke-result.json").write_text(json.dumps({"status": "passed", "version": __version__, "pages": len(prepared),
         "pdf_sizes_points": sizes, "physical_print_submitted": False,
-        "checks": ["import", "processing", "undo", "redo", "preview", "PDF", "mixed_orientation"]},
+        "checks": ["import", "processing", "undo", "redo", "preview", "PDF", "mixed_orientation",
+                   "whiteout_mouse", "whiteout_history", "whiteout_full_resolution", "originals_unchanged"]},
         ensure_ascii=False, indent=2), encoding="utf-8")

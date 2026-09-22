@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from dataclasses import replace
+from dataclasses import dataclass
 from pathlib import Path
 from threading import Event
 
@@ -8,7 +8,7 @@ import cv2
 import numpy as np
 from PIL import Image, ImageOps, UnidentifiedImageError
 
-from .models import EditSettings
+from .models import EditSettings, WhiteoutRegion
 
 cv2.setNumThreads(2)
 MAX_PIXELS = 60_000_000
@@ -66,11 +66,11 @@ def valid_quad(quad: np.ndarray) -> bool:
                 and min(np.linalg.norm(quad - np.roll(quad, 1, axis=0), axis=1)) > 0.02)
 
 
-def warp_document(rgb: np.ndarray, normalized_quad) -> np.ndarray:
+def perspective_transform(size, normalized_quad):
     quad = np.asarray(normalized_quad, np.float32)
     if not valid_quad(quad):
         raise ValueError("四个角必须围成不交叉的纸张区域，请重新调整。")
-    h, w = rgb.shape[:2]
+    w, h = size
     points = quad * np.array([w - 1, h - 1], np.float32)
     tl, tr, br, bl = points
     width = round(max(np.linalg.norm(tr - tl), np.linalg.norm(br - bl)))
@@ -78,38 +78,148 @@ def warp_document(rgb: np.ndarray, normalized_quad) -> np.ndarray:
     width, height = max(16, width), max(16, height)
     target = np.array([[0, 0], [width - 1, 0], [width - 1, height - 1], [0, height - 1]], np.float32)
     matrix = cv2.getPerspectiveTransform(points, target)
-    return cv2.warpPerspective(rgb, matrix, (width, height), flags=cv2.INTER_CUBIC,
+    return matrix, (width, height)
+
+
+def warp_document(rgb: np.ndarray, normalized_quad) -> np.ndarray:
+    matrix, size = perspective_transform((rgb.shape[1], rgb.shape[0]), normalized_quad)
+    return cv2.warpPerspective(rgb, matrix, size, flags=cv2.INTER_CUBIC,
                                borderMode=cv2.BORDER_CONSTANT, borderValue=(255, 255, 255))
 
 
-def rotate_expanded(rgb: np.ndarray, angle: float) -> np.ndarray:
+def expanded_rotation(size, angle: float):
     if abs(angle) < 0.03:
-        return rgb
-    h, w = rgb.shape[:2]
+        return np.eye(3), size
+    w, h = size
     matrix = cv2.getRotationMatrix2D((w / 2, h / 2), angle, 1)
     cosine, sine = abs(matrix[0, 0]), abs(matrix[0, 1])
     new_w, new_h = int(np.ceil(h * sine + w * cosine)), int(np.ceil(h * cosine + w * sine))
     matrix[0, 2] += (new_w - w) / 2
     matrix[1, 2] += (new_h - h) / 2
-    return cv2.warpAffine(rgb, matrix, (new_w, new_h), flags=cv2.INTER_CUBIC,
+    return np.vstack((matrix, [0, 0, 1])), (new_w, new_h)
+
+
+def rotate_expanded(rgb: np.ndarray, angle: float) -> np.ndarray:
+    if abs(angle) < 0.03:
+        return rgb
+    matrix, size = expanded_rotation((rgb.shape[1], rgb.shape[0]), angle)
+    return cv2.warpAffine(rgb, matrix[:2], size, flags=cv2.INTER_CUBIC,
                           borderMode=cv2.BORDER_CONSTANT, borderValue=(255, 255, 255))
 
 
-def geometry(rgb: np.ndarray, settings: EditSettings, include_crop=True) -> np.ndarray:
-    result = warp_document(rgb, settings.quad) if settings.quad is not None else rgb
-    if settings.rotation % 4:
-        result = np.ascontiguousarray(np.rot90(result, -(settings.rotation % 4)))
-    result = rotate_expanded(result, settings.deskew)
+@dataclass(frozen=True)
+class GeometryStep:
+    operation: str
+    matrix: np.ndarray
+    size: tuple[int, int]
+    crop: tuple[int, int, int, int] | None = None
+
+
+def geometry_steps(size, settings: EditSettings, include_crop=True):
+    """One source of pixel dimensions/rounding for both images and annotations."""
+    steps = []
+    if settings.quad is not None:
+        matrix, size = perspective_transform(size, settings.quad)
+        steps.append(GeometryStep("perspective", matrix, size))
+    for _ in range(settings.rotation % 4):
+        w, h = size
+        matrix = np.array([[0, -1, h - 1], [1, 0, 0], [0, 0, 1]], dtype=float)
+        size = h, w
+        steps.append(GeometryStep("quarter", matrix, size))
+    if abs(settings.deskew) >= .03:
+        matrix, size = expanded_rotation(size, settings.deskew)
+        steps.append(GeometryStep("deskew", matrix, size))
     if include_crop and settings.crop is not None:
         left, top, right, bottom = settings.crop
         if not (0 <= left < right <= 1 and 0 <= top < bottom <= 1):
             raise ValueError("裁切范围无效。")
-        h, w = result.shape[:2]
+        w, h = size
         x0, y0 = int(left * w), int(top * h)
         x1, y1 = min(w, round(right * w)), min(h, round(bottom * h))
         if x1 - x0 < 8 or y1 - y0 < 8:
             raise ValueError("裁切区域太小，请扩大范围。")
-        result = result[y0:y1, x0:x1].copy()
+        size = x1 - x0, y1 - y0
+        matrix = np.array([[1, 0, -x0], [0, 1, -y0], [0, 0, 1]], dtype=float)
+        steps.append(GeometryStep("crop", matrix, size, (x0, y0, x1, y1)))
+    return steps
+
+
+def geometry_transform(size, settings: EditSettings, include_crop=True):
+    matrix = np.eye(3)
+    for step in geometry_steps(size, settings, include_crop):
+        matrix = step.matrix @ matrix
+        size = step.size
+    return matrix, size
+
+
+def geometry(rgb: np.ndarray, settings: EditSettings, include_crop=True) -> np.ndarray:
+    result = rgb
+    for step in geometry_steps((rgb.shape[1], rgb.shape[0]), settings, include_crop):
+        if step.operation == "perspective":
+            result = cv2.warpPerspective(result, step.matrix, step.size, flags=cv2.INTER_CUBIC,
+                                         borderMode=cv2.BORDER_CONSTANT, borderValue=(255, 255, 255))
+        elif step.operation == "quarter":
+            result = np.ascontiguousarray(np.rot90(result, -1))
+        elif step.operation == "deskew":
+            result = cv2.warpAffine(result, step.matrix[:2], step.size, flags=cv2.INTER_CUBIC,
+                                    borderMode=cv2.BORDER_CONSTANT, borderValue=(255, 255, 255))
+        else:
+            x0, y0, x1, y1 = step.crop
+            result = result[y0:y1, x0:x1].copy()
+    return result
+
+
+def transform_points(points, matrix):
+    points = np.asarray(points, dtype=float).reshape(-1, 2)
+    homogeneous = np.column_stack((points, np.ones(len(points)))) @ matrix.T
+    if not np.isfinite(homogeneous).all() or np.any(np.abs(homogeneous[:, 2]) < 1e-10):
+        raise ValueError("遮挡坐标无法映射，请重新框选。")
+    return homogeneous[:, :2] / homogeneous[:, 2:]
+
+
+def whiteout_from_rect(rect, source_size, settings: EditSettings) -> WhiteoutRegion:
+    """Rect is in the current processed image's pixel coordinates."""
+    left, top, right, bottom = rect
+    if not np.isfinite(rect).all() or right - left < 2 or bottom - top < 2:
+        raise ValueError("遮挡区域太小，请重新框选。")
+    matrix, _ = geometry_transform(source_size, settings)
+    points = transform_points(((left, top), (right, top), (right, bottom), (left, bottom)), np.linalg.inv(matrix))
+    points /= np.array(source_size) - 1
+    return WhiteoutRegion(tuple(tuple(float(v) for v in point) for point in points))
+
+
+def whiteout_polygons(source_size, settings: EditSettings):
+    matrix, output_size = geometry_transform(source_size, settings)
+    # Clip in the source plane before projection: annotations outside a new
+    # paper selection must not cross a perspective horizon and cover other text.
+    paper = np.asarray(settings.quad or ((0, 0), (1, 0), (1, 1), (0, 1)), np.float32)
+    w, h = output_size
+    canvas = np.array(((0, 0), (w - 1, 0), (w - 1, h - 1), (0, h - 1)), np.float32)
+    polygons = []
+    for region in settings.whiteouts:
+        quad = np.asarray(region.source_quad, np.float32)
+        if quad.shape != (4, 2) or not np.isfinite(quad).all() or not cv2.isContourConvex(quad):
+            raise ValueError("遮挡区域无效，请删除后重新框选。")
+        area, clipped = cv2.intersectConvexConvex(quad, paper)
+        polygon = np.empty((0, 2), dtype=float)
+        if area > 0 and clipped is not None:
+            points = clipped.reshape(-1, 2) * (np.array(source_size) - 1)
+            projected = transform_points(points, matrix).astype(np.float32)
+            area, clipped = cv2.intersectConvexConvex(projected, canvas)
+            if area > 0 and clipped is not None:
+                polygon = clipped.reshape(-1, 2)
+        polygons.append(polygon)
+    return polygons
+
+
+def apply_whiteouts(rgb, source_size, settings: EditSettings, cancel=None):
+    result = rgb.copy()
+    for polygon in whiteout_polygons(source_size, settings):
+        checkpoint(cancel)
+        if len(polygon) >= 3:
+            # Solid fill only; no translucent overlay or editor outline reaches output.
+            cv2.fillConvexPoly(result, np.rint(polygon * 256).astype(np.int32),
+                              (255, 255, 255), lineType=cv2.LINE_8, shift=8)
     return result
 
 
@@ -242,4 +352,6 @@ def process(rgb: np.ndarray, settings: EditSettings, maximum: int | None = None,
     checkpoint(cancel)
     result = enhance(result, settings.whitening, settings.ink, settings.grayscale, cancel)
     checkpoint(cancel)
+    if settings.whiteouts:
+        result = apply_whiteouts(result, (rgb.shape[1], rgb.shape[0]), settings, cancel)
     return np.ascontiguousarray(result)
